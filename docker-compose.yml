@@ -1,0 +1,153 @@
+version: '3.8'
+
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    hostname: zookeeper
+    container_name: blockchain-monitor-zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - blockchain-monitor-network
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    hostname: kafka
+    container_name: blockchain-monitor-kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      - "9101:9101"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: 'zookeeper:2181'
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_JMX_PORT: 9101
+      KAFKA_JMX_HOSTNAME: localhost
+      # Create topics automatically
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+    healthcheck:
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "localhost:9092"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - blockchain-monitor-network
+
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    container_name: blockchain-monitor-kafka-ui
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:29092
+      KAFKA_CLUSTERS_0_ZOOKEEPER: zookeeper:2181
+    networks:
+      - blockchain-monitor-network
+
+  # Optional: Kafka Topics Creation
+  kafka-init:
+    image: confluentinc/cp-kafka:7.4.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint: [ '/bin/sh', '-c' ]
+    command: |
+      "
+      # Wait for Kafka to be ready
+      echo 'Waiting for Kafka to be ready...'
+      until kafka-topics --bootstrap-server kafka:29092 --list; do
+        echo 'Waiting for Kafka...'
+        sleep 2
+      done
+      
+      # Create topics
+      echo 'Creating Kafka topics...'
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic blockchain-transactions --partitions 3 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic blockchain-transactions-dlq --partitions 1 --replication-factor 1
+      kafka-topics --bootstrap-server kafka:29092 --create --if-not-exists --topic health-checks --partitions 1 --replication-factor 1
+      
+      echo 'Topics created successfully'
+      kafka-topics --bootstrap-server kafka:29092 --list
+      "
+    networks:
+      - blockchain-monitor-network
+
+  # Optional: Simple Kafka consumer for testing
+  kafka-consumer:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: blockchain-monitor-consumer
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    entrypoint: [ '/bin/sh', '-c' ]
+    command: |
+      "
+      echo 'Starting Kafka consumer for blockchain-transactions topic...'
+      kafka-console-consumer --bootstrap-server kafka:29092 --topic blockchain-transactions --from-beginning --property print.headers=true --property print.timestamp=true
+      "
+    networks:
+      - blockchain-monitor-network
+    profiles:
+      - testing  # Only start with --profile testing
+
+  # Redis for caching (optional)
+  redis:
+    image: redis:7-alpine
+    container_name: blockchain-monitor-redis
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis-data:/data
+    networks:
+      - blockchain-monitor-network
+    profiles:
+      - cache
+
+  # PostgreSQL for storing processed transactions (optional)
+  postgres:
+    image: postgres:15-alpine
+    container_name: blockchain-monitor-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_DB: blockchain_monitor
+      POSTGRES_USER: monitor_user
+      POSTGRES_PASSWORD: monitor_password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql
+    networks:
+      - blockchain-monitor-network
+    profiles:
+      - database
+
+volumes:
+  redis-data:
+  postgres-data:
+
+networks:
+  blockchain-monitor-network:
+    driver: bridge 
